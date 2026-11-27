@@ -1,20 +1,32 @@
-"""Versioned FastAPI scoring boundary and composition root."""
+"""Versioned FastAPI matching boundary and composition root."""
 
 import json
 import logging
-from typing import Annotated, Literal, Protocol
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from typing import Annotated, Literal, Protocol, Self
 from uuid import UUID, uuid4
 
+import httpx2
 import jwt
 from fastapi import FastAPI, HTTPException, Request, Response, Security
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.security import OpenIdConnect
 from fastapi.security.utils import get_authorization_scheme_param
-from pydantic import AnyHttpUrl, Field, ValidationError, field_validator
+from pydantic import AnyHttpUrl, Field, SecretStr, ValidationError, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from starlette.middleware.base import RequestResponseEndpoint
 
+from careeros_matching.adapters.gateway import HttpRequirementGateway
+from careeros_matching.application.extraction import (
+    ExtractionInput,
+    ExtractionResponseInvalid,
+    ExtractionResult,
+    ExtractionUnavailable,
+    ExtractRequirements,
+    RequirementGateway,
+)
 from careeros_matching.application.scoring import Actor, Denied, ScoreMatch, SnapshotNotFound
 from careeros_matching.domain.scoring import BaselineScorer, Contract, MatchInput, MatchResult
 
@@ -25,15 +37,31 @@ class Settings(BaseSettings):
     oidc_audience: str = Field(min_length=1)
     oidc_jwks_url: AnyHttpUrl
     log_level: Literal["debug", "info", "warning", "error"] = "info"
+    ai_gateway_url: AnyHttpUrl | None = None
+    ai_gateway_token: SecretStr | None = None
+    ai_gateway_timeout: float = Field(default=45, gt=0, le=240)
 
-    @field_validator("oidc_issuer", "oidc_jwks_url")
+    @field_validator("oidc_issuer", "oidc_jwks_url", "ai_gateway_url")
     @classmethod
-    def trusted_url(cls, url: AnyHttpUrl) -> AnyHttpUrl:
+    def trusted_url(cls, url: AnyHttpUrl | None) -> AnyHttpUrl | None:
+        if url is None:
+            return url
         if url.username or url.password or url.query or url.fragment:
-            raise ValueError("OIDC URLs cannot include credentials, queries or fragments")
+            raise ValueError("service URLs cannot include credentials, queries or fragments")
         if url.scheme != "https" and url.host not in {"localhost", "127.0.0.1", "[::1]"}:
-            raise ValueError("OIDC uses HTTPS outside local development")
+            raise ValueError("service URLs require HTTPS outside local development")
         return url
+
+    @model_validator(mode="after")
+    def gateway_configuration(self) -> Self:
+        if (self.ai_gateway_url is None) != (self.ai_gateway_token is None):
+            raise ValueError("AI_GATEWAY_URL and AI_GATEWAY_TOKEN must be configured together")
+        if (
+            self.ai_gateway_token is not None
+            and not self.ai_gateway_token.get_secret_value().strip()
+        ):
+            raise ValueError("AI_GATEWAY_TOKEN cannot be empty")
+        return self
 
 
 class Problem(Contract):
@@ -80,13 +108,19 @@ class OidcTokenVerifier:
 
 _PROBLEMS = {
     401: ("UNAUTHENTICATED", "A valid bearer token is required."),
-    403: ("FORBIDDEN", "The matching:score scope is required."),
+    403: ("FORBIDDEN", "The required matching scope is missing."),
     404: ("SNAPSHOT_NOT_FOUND", "A requested snapshot is unavailable to the caller."),
     422: ("VALIDATION_FAILED", "Invalid match input."),
+    502: ("EXTRACTION_RESPONSE_INVALID", "Extraction provider response failed validation."),
+    503: ("EXTRACTION_UNAVAILABLE", "Requirement extraction is temporarily unavailable."),
 }
 
 
-def create_app(settings: Settings | None = None, verifier: TokenVerifier | None = None) -> FastAPI:
+def create_app(
+    settings: Settings | None = None,
+    verifier: TokenVerifier | None = None,
+    extractor: RequirementGateway | None = None,
+) -> FastAPI:
     config = settings or Settings()
     issuer = str(config.oidc_issuer).rstrip("/")
     token_verifier = verifier or OidcTokenVerifier(
@@ -96,9 +130,29 @@ def create_app(settings: Settings | None = None, verifier: TokenVerifier | None 
         openIdConnectUrl=f"{issuer}/.well-known/openid-configuration", auto_error=False
     )
     scoring = ScoreMatch(BaselineScorer())
+    upstream_client = None
+    if (
+        extractor is None
+        and config.ai_gateway_url is not None
+        and config.ai_gateway_token is not None
+    ):
+        upstream_client = httpx2.Client(timeout=config.ai_gateway_timeout, trust_env=False)
+        extractor = HttpRequirementGateway(
+            upstream_client, str(config.ai_gateway_url), config.ai_gateway_token.get_secret_value()
+        )
+    extraction = ExtractRequirements(extractor)
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        try:
+            yield
+        finally:
+            if upstream_client is not None:
+                upstream_client.close()
+
     logger = logging.getLogger("careeros.matching.http")
     logger.setLevel(config.log_level.upper())
-    app = FastAPI(title="CareerOS Matching Service", version="1.0.0")
+    app = FastAPI(title="CareerOS Matching Service", version="1.1.0", lifespan=lifespan)
 
     @app.middleware("http")
     async def correlation(request: Request, call_next: RequestResponseEndpoint) -> Response:
@@ -152,7 +206,7 @@ def create_app(settings: Settings | None = None, verifier: TokenVerifier | None 
         return {"status": "ready"}
 
     def authenticate(
-        token: Annotated[str | None, Security(oidc, scopes=["matching:score"])],
+        token: Annotated[str | None, Security(oidc)],
     ) -> Actor:
         scheme, credentials = get_authorization_scheme_param(token or "")
         if scheme.lower() != "bearer" or not credentials:
@@ -162,23 +216,50 @@ def create_app(settings: Settings | None = None, verifier: TokenVerifier | None 
         except ValueError:
             raise HTTPException(401) from None
 
+    responses: dict[int | str, dict[str, object]] = {
+        status: {
+            "description": detail,
+            "content": {"application/problem+json": {"schema": Problem.model_json_schema()}},
+        }
+        for status, (_, detail) in _PROBLEMS.items()
+    }
+
     @app.post(
         "/v1/internal/matches/score",
         response_model=MatchResult,
         responses={
-            status: {
-                "description": detail,
-                "content": {"application/problem+json": {"schema": Problem.model_json_schema()}},
-            }
-            for status, (_, detail) in _PROBLEMS.items()
+            status: problem
+            for status, problem in responses.items()
+            if status in (401, 403, 404, 422)
         },
     )
-    def score(pair: MatchInput, actor: Annotated[Actor, Security(authenticate)]) -> MatchResult:
+    def score(
+        pair: MatchInput, actor: Annotated[Actor, Security(authenticate, scopes=["matching:score"])]
+    ) -> MatchResult:
         try:
             return scoring.execute(actor, pair)
         except Denied:
             raise HTTPException(403) from None
         except SnapshotNotFound:
             raise HTTPException(404) from None
+
+    @app.post(
+        "/v1/internal/requirements/extract", response_model=ExtractionResult, responses=responses
+    )
+    def extract(
+        command: ExtractionInput,
+        request: Request,
+        actor: Annotated[Actor, Security(authenticate, scopes=["matching:extract"])],
+    ) -> ExtractionResult:
+        try:
+            return extraction.execute(actor, command, request.state.correlation_id)
+        except Denied:
+            raise HTTPException(403) from None
+        except SnapshotNotFound:
+            raise HTTPException(404) from None
+        except ExtractionResponseInvalid:
+            raise HTTPException(502) from None
+        except ExtractionUnavailable:
+            raise HTTPException(503) from None
 
     return app

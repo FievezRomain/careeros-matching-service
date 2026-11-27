@@ -17,6 +17,14 @@ class SnapshotNotFound(Exception):
     pass
 
 
+def require_access(actor: Actor, scope: str, *snapshots: Owner) -> None:
+    if scope not in actor.scopes:
+        raise Denied
+    owner = (actor.account_id, actor.tenant_id)
+    if any((item.account_id, item.tenant_id) != owner for item in snapshots):
+        raise SnapshotNotFound
+
+
 class Scorer(Protocol):
     def score(self, pair: MatchInput) -> MatchResult: ...
 
@@ -26,11 +34,5 @@ class ScoreMatch:
         self._scorer = scorer
 
     def execute(self, actor: Actor, pair: MatchInput) -> MatchResult:
-        if "matching:score" not in actor.scopes:
-            raise Denied
-        owner = (actor.account_id, actor.tenant_id)
-        if any(
-            (item.account_id, item.tenant_id) != owner for item in (pair.profile, pair.opportunity)
-        ):
-            raise SnapshotNotFound
+        require_access(actor, "matching:score", pair.profile, pair.opportunity)
         return self._scorer.score(pair)
