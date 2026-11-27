@@ -64,6 +64,23 @@ records the opportunity, extractor, model and prompt versions and available usag
 metadata. A bad gateway response returns `502`; unavailability returns `503`.
 Suggestions remain separate from the confirmed requirement input to scoring.
 
+### V1-025 score explanation
+
+The scoring response adds `explanation` version `evidence-v1`. Each finding
+includes the minimum level, confirmed level or null, eligibility flag, weight
+and earned weight. A confirmed missing requirement earns zero. An unknown one
+has null earned weight and is excluded from the assessed weight and score.
+
+The explanation shows assessed and total requirement counts and weights, and
+the earned weight. `scoreBounds` is a hypothetical interval for the same listed
+requirements. The lower endpoint assigns zero credit to every unknown weight,
+and the upper endpoint assigns full credit. Both use the usual integer rounding.
+This interval describes missing evidence; it is not a probability or forecast.
+With all requirements assessed, both endpoints equal the score and `uncertainty`
+is null. With some evidence absent, `uncertainty` is `unconfirmed_profile_facts`.
+With no verified requirements, the bounds are null and `uncertainty` is either
+`no_verified_requirements` or `external_to_verify`.
+
 ## Contract rules
 
 - APIs and events are versioned.
