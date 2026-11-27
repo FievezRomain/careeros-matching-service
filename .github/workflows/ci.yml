@@ -9,6 +9,23 @@ permissions:
 jobs:
   quality:
     runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: careeros_matching
+          POSTGRES_PASSWORD: test-only
+          POSTGRES_DB: careeros_matching_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U careeros_matching -d careeros_matching_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      MATCHING_DATABASE_URL: postgresql+psycopg://careeros_matching:test-only@localhost:5432/careeros_matching_test
+      TEST_MATCHING_DATABASE_URL: postgresql+psycopg://careeros_matching:test-only@localhost:5432/careeros_matching_test
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -22,6 +39,8 @@ jobs:
       - run: uv run pytest
       - run: uv run pip-audit
       - run: uv run bandit -q -r src
+      - run: uv run python -m careeros_matching.adapters.postgresql.migrations.runner upgrade
+      - run: uv run python -m careeros_matching.adapters.postgresql.migrations.runner downgrade
       - uses: actions/checkout@v4
         with:
           repository: FievezRomain/careeros-workspace

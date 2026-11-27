@@ -16,9 +16,13 @@ from fastapi.security import OpenIdConnect
 from fastapi.security.utils import get_authorization_scheme_param
 from pydantic import AnyHttpUrl, Field, SecretStr, ValidationError, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy import create_engine
 from starlette.middleware.base import RequestResponseEndpoint
 
 from careeros_matching.adapters.gateway import HttpRequirementGateway
+from careeros_matching.adapters.postgresql.migrations.runner import SqlMigrations
+from careeros_matching.adapters.postgresql.store import SqlRecommendationStore
+from careeros_matching.adapters.recommendations import mount_recommendations
 from careeros_matching.application.extraction import (
     ExtractionInput,
     ExtractionResponseInvalid,
@@ -27,7 +31,9 @@ from careeros_matching.application.extraction import (
     ExtractRequirements,
     RequirementGateway,
 )
+from careeros_matching.application.recommendation import Recommendations, RecommendationStore
 from careeros_matching.application.scoring import Actor, Denied, ScoreMatch, SnapshotNotFound
+from careeros_matching.application.startup import MigrationRunner, StartRecommendations
 from careeros_matching.domain.scoring import BaselineScorer, Contract, MatchInput, MatchResult
 
 
@@ -40,6 +46,7 @@ class Settings(BaseSettings):
     ai_gateway_url: AnyHttpUrl | None = None
     ai_gateway_token: SecretStr | None = None
     ai_gateway_timeout: float = Field(default=45, gt=0, le=240)
+    matching_database_url: SecretStr | None = None
 
     @field_validator("oidc_issuer", "oidc_jwks_url", "ai_gateway_url")
     @classmethod
@@ -62,6 +69,13 @@ class Settings(BaseSettings):
         ):
             raise ValueError("AI_GATEWAY_TOKEN cannot be empty")
         return self
+
+    @field_validator("matching_database_url")
+    @classmethod
+    def validate_database_url(cls, value: SecretStr | None) -> SecretStr | None:
+        if value is not None and not value.get_secret_value().startswith("postgresql+psycopg://"):
+            raise ValueError("MATCHING_DATABASE_URL must use PostgreSQL psycopg")
+        return value
 
 
 class Problem(Contract):
@@ -110,6 +124,7 @@ _PROBLEMS = {
     401: ("UNAUTHENTICATED", "A valid bearer token is required."),
     403: ("FORBIDDEN", "The required matching scope is missing."),
     404: ("SNAPSHOT_NOT_FOUND", "A requested snapshot is unavailable to the caller."),
+    409: ("PROJECTION_CONFLICT", "The projection conflicts with an existing version or event."),
     422: ("VALIDATION_FAILED", "Invalid match input."),
     502: ("EXTRACTION_RESPONSE_INVALID", "Extraction provider response failed validation."),
     503: ("EXTRACTION_UNAVAILABLE", "Requirement extraction is temporarily unavailable."),
@@ -120,6 +135,8 @@ def create_app(
     settings: Settings | None = None,
     verifier: TokenVerifier | None = None,
     extractor: RequirementGateway | None = None,
+    recommendation_store: RecommendationStore | None = None,
+    migration_runner: MigrationRunner | None = None,
 ) -> FastAPI:
     config = settings or Settings()
     issuer = str(config.oidc_issuer).rstrip("/")
@@ -129,7 +146,8 @@ def create_app(
     oidc = OpenIdConnect(
         openIdConnectUrl=f"{issuer}/.well-known/openid-configuration", auto_error=False
     )
-    scoring = ScoreMatch(BaselineScorer())
+    scorer = BaselineScorer()
+    scoring = ScoreMatch(scorer)
     upstream_client = None
     if (
         extractor is None
@@ -141,18 +159,37 @@ def create_app(
             upstream_client, str(config.ai_gateway_url), config.ai_gateway_token.get_secret_value()
         )
     extraction = ExtractRequirements(extractor)
+    engine = None
+    if recommendation_store is None and config.matching_database_url is not None:
+        engine = create_engine(config.matching_database_url.get_secret_value(), pool_pre_ping=True)
+        recommendation_store, migration_runner = (
+            SqlRecommendationStore(engine),
+            SqlMigrations(engine),
+        )
+    if (recommendation_store is None) != (migration_runner is None):
+        raise ValueError("recommendation storage requires a migration runner")
+    startup = StartRecommendations(migration_runner) if migration_runner is not None else None
+    recommendations = (
+        Recommendations(recommendation_store, scorer, extraction)
+        if recommendation_store is not None
+        else None
+    )
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         try:
+            if startup is not None:
+                startup.execute()
             yield
         finally:
             if upstream_client is not None:
                 upstream_client.close()
+            if engine is not None:
+                engine.dispose()
 
     logger = logging.getLogger("careeros.matching.http")
     logger.setLevel(config.log_level.upper())
-    app = FastAPI(title="CareerOS Matching Service", version="1.2.0", lifespan=lifespan)
+    app = FastAPI(title="CareerOS Matching Service", version="1.3.0", lifespan=lifespan)
 
     @app.middleware("http")
     async def correlation(request: Request, call_next: RequestResponseEndpoint) -> Response:
@@ -181,6 +218,8 @@ def create_app(
         code, detail = _PROBLEMS.get(
             status, ("REQUEST_FAILED", "The request could not be completed.")
         )
+        if isinstance(error, HTTPException) and error.detail == "RECOMMENDATIONS_UNAVAILABLE":
+            code, detail = "RECOMMENDATIONS_UNAVAILABLE", "Recommendation storage is unavailable."
         payload = Problem(
             type=f"urn:careeros:problem:{code.lower()}",
             title=code.replace("_", " ").title(),
@@ -262,4 +301,5 @@ def create_app(
         except ExtractionUnavailable:
             raise HTTPException(503) from None
 
+    mount_recommendations(app, authenticate, recommendations)
     return app
