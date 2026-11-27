@@ -11,6 +11,7 @@ Key = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_
 Level = Annotated[int, Field(strict=True, ge=0, le=5)]
 SourceAccess = Literal["full_text", "external_to_verify"]
 Status = Literal["satisfied", "partial", "missing", "unknown"]
+Uncertainty = Literal["unconfirmed_profile_facts", "no_verified_requirements", "external_to_verify"]
 
 
 def normalize_key(key: str) -> str:
@@ -90,6 +91,27 @@ class Finding(Contract):
     statement: str
     status: Status
     fact_id: UUID | None
+    minimum_level: Level
+    confirmed_level: Level | None
+    hard_eligibility: bool
+    weight: Literal[1, 2]
+    earned_weight: float | None = Field(ge=0, le=2)
+
+
+class ScoreBounds(Contract):
+    minimum: int = Field(ge=0, le=100)
+    maximum: int = Field(ge=0, le=100)
+
+
+class ScoreExplanation(Contract):
+    version: Literal["evidence-v1"] = "evidence-v1"
+    assessed_requirements: int = Field(ge=0, le=100)
+    total_requirements: int = Field(ge=0, le=100)
+    assessed_weight: int = Field(ge=0, le=200)
+    total_weight: int = Field(ge=0, le=200)
+    earned_weight: float = Field(ge=0, le=200)
+    uncertainty: Uncertainty | None
+    score_bounds: ScoreBounds | None
 
 
 class MatchResult(Contract):
@@ -100,6 +122,7 @@ class MatchResult(Contract):
     score: int | None = Field(ge=0, le=100)
     findings: tuple[Finding, ...]
     hard_conflicts: tuple[UUID, ...]
+    explanation: ScoreExplanation
     limitation: str = (
         "This score supports prioritization and does not guarantee an interview or employment."
     )
@@ -113,36 +136,74 @@ def status_for(requirement: Requirement, fact: Fact | None) -> Status:
     return "partial" if fact.level > 0 else "missing"
 
 
+def _rounded_score(earned_half_units: int, weight: int) -> int:
+    return (100 * earned_half_units + weight) // (2 * weight)
+
+
 class BaselineScorer:
     def score(self, pair: MatchInput) -> MatchResult:
         facts = {normalize_key(fact.key): fact for fact in pair.profile.confirmed_facts}
         findings: list[Finding] = []
         conflicts: list[UUID] = []
-        earned = known_weight = 0
+        earned_half_units = assessed_weight = assessed_count = total_weight = 0
+        source_access = pair.opportunity.source_access
         for item in sorted(pair.opportunity.requirements, key=lambda item: item.requirement_id):
             fact = facts.get(normalize_key(item.key))
             status = status_for(item, fact)
+            weight: Literal[1, 2] = 2 if item.mandatory else 1
+            total_weight += weight
+            credit = {"satisfied": 2, "partial": 1, "missing": 0}.get(status)
+            earned = credit * weight if credit is not None else None
             findings.append(
                 Finding(
                     requirement_id=item.requirement_id,
                     statement=item.statement,
                     status=status,
                     fact_id=fact.fact_id if fact else None,
+                    minimum_level=item.minimum_level,
+                    confirmed_level=fact.level if fact else None,
+                    hard_eligibility=item.hard_eligibility,
+                    weight=weight,
+                    earned_weight=earned / 2 if earned is not None else None,
                 )
             )
-            if status == "unknown":
+            if earned is None:
                 continue
-            weight = 2 if item.mandatory else 1
-            known_weight += weight
-            earned += weight * {"satisfied": 2, "partial": 1, "missing": 0}[status]
+            assessed_weight += weight
+            assessed_count += 1
+            earned_half_units += earned
             if item.hard_eligibility and status != "satisfied":
                 conflicts.append(item.requirement_id)
-        score = (100 * earned + known_weight) // (2 * known_weight) if known_weight else None
+        unknown_weight = total_weight - assessed_weight
+        uncertainty: Uncertainty | None = None
+        if source_access == "external_to_verify":
+            uncertainty = "external_to_verify"
+        elif not total_weight:
+            uncertainty = "no_verified_requirements"
+        elif unknown_weight:
+            uncertainty = "unconfirmed_profile_facts"
+        bounds = (
+            ScoreBounds(
+                minimum=_rounded_score(earned_half_units, total_weight),
+                maximum=_rounded_score(earned_half_units + 2 * unknown_weight, total_weight),
+            )
+            if total_weight
+            else None
+        )
         return MatchResult(
             profile_snapshot_id=pair.profile.snapshot_id,
             opportunity_version_id=pair.opportunity.version_id,
-            source_access=pair.opportunity.source_access,
-            score=score,
+            source_access=source_access,
+            score=_rounded_score(earned_half_units, assessed_weight) if assessed_weight else None,
             findings=tuple(findings),
             hard_conflicts=tuple(conflicts),
+            explanation=ScoreExplanation(
+                assessed_requirements=assessed_count,
+                total_requirements=len(findings),
+                assessed_weight=assessed_weight,
+                total_weight=total_weight,
+                earned_weight=earned_half_units / 2,
+                uncertainty=uncertainty,
+                score_bounds=bounds,
+            ),
         )

@@ -8,7 +8,7 @@ from pydantic import ValidationError
 
 from careeros_matching.adapters.http import Settings, create_app
 from careeros_matching.application.scoring import Actor
-from careeros_matching.domain.scoring import BaselineScorer, MatchInput
+from careeros_matching.domain.scoring import BaselineScorer, MatchInput, ScoreBounds
 
 PATH = "/v1/internal/matches/score"
 STATEMENT = "Synthetic source evidence"
@@ -63,6 +63,21 @@ def test_unknown_does_not_create_a_score_or_conflict() -> None:
     assert result.score is None
     assert result.findings[0].status == "unknown"
     assert result.hard_conflicts == ()
+    assert result.findings[0].earned_weight is None
+    assert result.explanation.assessed_weight == 0
+    assert result.explanation.score_bounds == ScoreBounds(minimum=0, maximum=100)
+
+
+def test_complete_evidence_collapses_bounds_to_the_baseline_score() -> None:
+    data = pair()
+    data["profile"]["confirmedFacts"] = [{"factId": uid(6), "key": "Python", "level": 1}]
+    result = BaselineScorer().score(MatchInput.model_validate(data))
+    assert result.score == 50
+    assert result.findings[0].earned_weight == 1
+    assert result.hard_conflicts == (UUID(int=5),)
+    assert result.explanation.assessed_weight == result.explanation.total_weight == 2
+    assert result.explanation.uncertainty is None
+    assert result.explanation.score_bounds == ScoreBounds(minimum=50, maximum=50)
 
 
 def test_insecure_oidc_configuration_is_rejected() -> None:
@@ -77,8 +92,10 @@ def test_insecure_oidc_configuration_is_rejected() -> None:
 def test_http_contract_and_safe_logs(client: TestClient, caplog: pytest.LogCaptureFixture) -> None:
     assert client.get("/health/live").json()["status"] == "ok"
     assert client.get("/health/ready").json()["status"] == "ready"
-    operation = client.get("/openapi.json").json()["paths"][PATH]["post"]
+    schema = client.get("/openapi.json").json()
+    operation = schema["paths"][PATH]["post"]
     assert operation["security"]
+    assert "explanation" in schema["components"]["schemas"]["MatchResult"]["properties"]
     assert "application/problem+json" in operation["responses"]["404"]["content"]
     headers = {"Authorization": "Bearer fixture-allowed", "X-Correlation-ID": uid(99)}
     with caplog.at_level(logging.INFO, logger="careeros.matching.http"):

@@ -152,7 +152,7 @@ def create_app(
 
     logger = logging.getLogger("careeros.matching.http")
     logger.setLevel(config.log_level.upper())
-    app = FastAPI(title="CareerOS Matching Service", version="1.1.0", lifespan=lifespan)
+    app = FastAPI(title="CareerOS Matching Service", version="1.2.0", lifespan=lifespan)
 
     @app.middleware("http")
     async def correlation(request: Request, call_next: RequestResponseEndpoint) -> Response:
