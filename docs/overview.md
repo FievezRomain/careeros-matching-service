@@ -44,6 +44,26 @@ IDs where available, and a prioritization limitation. Replaying the same input i
 Calculations are stateless and logs contain correlation and status only. V1-024 handles
 extraction, V1-025 expands explanations and V1-058 owns recommendation orchestration.
 
+### V1-024 requirement extraction
+
+`POST /v1/internal/requirements/extract` requires `matching:extract` and the
+same account and tenant as the supplied `opportunityVersionId`. For `full_text`,
+provide `jobText` (at most 30,000 characters) and `sourceLanguage` (e.g. `fr-BE`).
+For `external_to_verify`, omit `jobText`. The result leaves the link unassessed.
+
+Set `AI_GATEWAY_URL` and inject `AI_GATEWAY_TOKEN` with scope `ai:invoke`. The
+gateway receives the text and language using `extract-job-requirements` v1.0.
+It owns provider redaction. Matching propagates correlation and a stable key
+derived from the owner, version, extractor and input. The HTTP timeout defaults
+to 45 seconds. Matching keeps no response cache and performs no automatic retries.
+
+`requirements-v1` returns suggestions only when every quoted excerpt occurs in
+the source and the requirement text occurs in an excerpt. `partial` reports
+discarded suggestions. `inconclusive` means none could be retained. The result
+records the opportunity, extractor, model and prompt versions and available usage
+metadata. A bad gateway response returns `502`; unavailability returns `503`.
+Suggestions remain separate from the confirmed requirement input to scoring.
+
 ## Contract rules
 
 - APIs and events are versioned.
