@@ -81,6 +81,44 @@ is null. With some evidence absent, `uncertainty` is `unconfirmed_profile_facts`
 With no verified requirements, the bounds are null and `uncertainty` is either
 `no_verified_requirements` or `external_to_verify`.
 
+### V1-058 recommendations
+
+Set `MATCHING_DATABASE_URL` to the service-owned PostgreSQL database. Startup
+applies and verifies the adapter-owned schema before accepting requests.
+Account-bound projectors use `POST /v1/internal/recommendation-updates` with
+`matching:recommendations:write`. A `profile` update carries the confirmed
+snapshot and active criteria. An `opportunity` update carries its stable group,
+immutable version, state and verified scoring requirements. A new full-text
+version includes source text and language. An unchanged version can update its
+lifecycle state and reuses the prior verified requirements. Contact changes are
+acknowledged without rematching. Each stream supplies a monotonic revision and an
+event ID. Replays have no side effects, and conflicting reuse returns `409`.
+
+The matching database keeps validated evidence and a source fingerprint. A
+successful extraction is cached by tenant, opportunity and extractor version.
+A retry after an interrupted upstream call reuses the same gateway key.
+Requirement suggestions remain available for inspection through
+`GET /v1/recommendations/{groupId}/extraction`. Matching scores only requirements
+grounded in the owned full-text source. Corrections carry revised requirements
+and that same source through `POST /v1/internal/recommendation-corrections` with
+`matching:recommendations:correct`. The correction records a separate evidence
+revision and preserves both the canonical job version and the older result.
+
+Profile changes rematch actionable opportunities observed in the preceding 30
+days. Exact normalized role, location, contract and remote values apply when
+configured, alongside exclusions and the score threshold. Unknown criteria and
+link-only jobs remain unassessed. `GET /v1/recommendations` returns active results
+by score followed by unassessed results. Owned detail and history at
+`/v1/recommendations/{groupId}` and `/history` expose inactive decisions and earlier
+evidence. All three operations require `matching:recommendations:read`.
+
+Each inactive-to-active transition commits one CloudEvent with minimal identifiers.
+`GET /v1/internal/recommendation-events` provides the append-only, owned outbox
+with `matching:recommendations:deliver`. List and history endpoints accept `limit`
+and `offset`. A relay advances its offset after downstream delivery is confirmed
+and consumers deduplicate using the event ID. The event expresses a matching
+decision and the delivery workflow owns channel preferences and approvals.
+
 ## Contract rules
 
 - APIs and events are versioned.

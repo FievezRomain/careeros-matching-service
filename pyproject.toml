@@ -3,7 +3,7 @@ name = "careeros-matching-service"
 version = "0.1.0"
 description = "CareerOS deterministic matching boundary"
 requires-python = ">=3.14,<3.15"
-dependencies = ["fastapi>=0.165,<0.166", "httpx2>=2.16,<3", "pydantic>=2.12,<3", "pydantic-settings>=2.16,<3", "pyjwt[crypto]>=2.10,<3", "uvicorn>=0.54,<0.55"]
+dependencies = ["fastapi>=0.165,<0.166", "httpx2>=2.16,<3", "psycopg[binary]>=3.3,<4", "pydantic>=2.12,<3", "pydantic-settings>=2.16,<3", "pyjwt[crypto]>=2.10,<3", "sqlalchemy>=2.0,<3", "uvicorn>=0.54,<0.55"]
 
 [dependency-groups]
 dev = ["bandit>=1.9,<2", "mypy>=1.19,<2", "pip-audit>=2.10,<3", "pytest>=9.2,<10", "ruff>=0.14,<0.15"]
@@ -37,12 +37,14 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 
 [tool.careeros.quality]
 package = "src/careeros_matching"
-persistence = false
+persistence = true
 domain = "src/careeros_matching/domain"
 application = "src/careeros_matching/application"
 ports = "src/careeros_matching/application"
 adapters = "src/careeros_matching/adapters"
 composition_root = "src/careeros_matching/adapters/http.py"
+migrations = "src/careeros_matching/adapters/postgresql/migrations"
+migration_runner = "src/careeros_matching/adapters/postgresql/migrations/runner.py"
 
 [tool.careeros.quality.commands]
 format = "uv run ruff format --check ."
@@ -51,6 +53,8 @@ type = "uv run mypy src tests"
 test = "uv run pytest"
 secret = "gitleaks detect --redact --no-banner"
 security = "uv run pip-audit && uv run bandit -q -r src"
+migrate_up = "uv run python -m careeros_matching.adapters.postgresql.migrations.runner upgrade"
+migrate_down = "uv run python -m careeros_matching.adapters.postgresql.migrations.runner downgrade"
 
 [tool.careeros.quality.logging]
 structured = true
@@ -64,3 +68,5 @@ contract = "tests/test_scoring.py"
 health = "tests/test_scoring.py"
 logging = "tests/test_scoring.py"
 security = "tests/test_scoring.py"
+migrations = "tests/test_recommendations.py"
+startup_migrations = "tests/test_recommendations.py"

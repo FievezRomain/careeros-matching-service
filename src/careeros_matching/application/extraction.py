@@ -103,6 +103,11 @@ class ExtractRequirements:
         self, actor: Actor, command: ExtractionInput, correlation_id: UUID
     ) -> ExtractionResult:
         require_access(actor, "matching:extract", command)
+        return self.extract(command, correlation_id)
+
+    def extract(
+        self, command: ExtractionInput, correlation_id: UUID, *, shared_key: str | None = None
+    ) -> ExtractionResult:
         version = command.opportunity_version_id
         if command.job_text is None or command.source_language is None:
             return ExtractionResult(opportunity_version_id=version, status="external_to_verify")
@@ -111,15 +116,15 @@ class ExtractRequirements:
         source = SourceText(job_text=command.job_text, source_language=command.source_language)
         identity = json.dumps(
             [
-                str(actor.tenant_id),
-                str(actor.account_id),
+                str(command.tenant_id),
+                str(command.account_id),
                 str(version),
                 EXTRACTOR_VERSION,
                 source.model_dump_json(),
             ]
         )
         upstream = self._gateway.extract(
-            source, hashlib.sha256(identity.encode()).hexdigest(), correlation_id
+            source, shared_key or hashlib.sha256(identity.encode()).hexdigest(), correlation_id
         )
         suggestions: dict[UUID, Suggestion] = {}
         rejected = 0
