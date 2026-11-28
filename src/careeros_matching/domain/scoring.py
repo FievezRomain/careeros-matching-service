@@ -1,7 +1,8 @@
 """Validated scoring evidence and the deterministic V1 policy."""
 
+import re
 import unicodedata
-from typing import Annotated, Literal, Self
+from typing import Annotated, Final, Literal, Self, cast
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StringConstraints, model_validator
@@ -9,6 +10,11 @@ from pydantic.alias_generators import to_camel
 
 Key = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)]
 Level = Annotated[int, Field(strict=True, ge=0, le=5)]
+Months = Annotated[int, Field(strict=True, ge=0, le=1200)]
+Cefr = Literal["A1", "A2", "B1", "B2", "C1", "C2"]
+CEFR_RANK = {value: index for index, value in enumerate(("A1", "A2", "B1", "B2", "C1", "C2"))}
+QualificationUnit = Literal["level", "experience_months", "cefr"]
+QUALIFICATION_POLICY: Final = "explicit-requirements-v1"
 SourceAccess = Literal["full_text", "external_to_verify"]
 Status = Literal["satisfied", "partial", "missing", "unknown"]
 Uncertainty = Literal["unconfirmed_profile_facts", "no_verified_requirements", "external_to_verify"]
@@ -33,6 +39,8 @@ class Fact(Contract):
     fact_id: UUID
     key: Key
     level: Level
+    experience_months: Months | None = Field(default=None, exclude_if=lambda value: value is None)
+    cefr: Cefr | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class ProfileSnapshot(Owner):
@@ -86,6 +94,13 @@ class MatchInput(Contract):
     opportunity: OpportunityVersion
 
 
+class Qualification(Contract):
+    unit: QualificationUnit
+    required: int | Cefr
+    confirmed: int | Cefr | None
+    status: Literal["met", "not_met", "unknown"]
+
+
 class Finding(Contract):
     requirement_id: UUID
     statement: str
@@ -96,6 +111,9 @@ class Finding(Contract):
     hard_eligibility: bool
     weight: Literal[1, 2]
     earned_weight: float | None = Field(ge=0, le=2)
+    qualification: Qualification | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 class ScoreBounds(Contract):
@@ -123,6 +141,9 @@ class MatchResult(Contract):
     findings: tuple[Finding, ...]
     hard_conflicts: tuple[UUID, ...]
     explanation: ScoreExplanation
+    qualification_policy: Literal["explicit-requirements-v1"] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     limitation: str = (
         "This score supports prioritization and does not guarantee an interview or employment."
     )
@@ -134,6 +155,92 @@ def status_for(requirement: Requirement, fact: Fact | None) -> Status:
     if fact.level >= requirement.minimum_level:
         return "satisfied"
     return "partial" if fact.level > 0 else "missing"
+
+
+AMBIGUOUS = re.compile(
+    r";|\b(?:or|ou|and|et|either|between|entre|maximum|max|under|overall|including|dont)\b|"
+    r"\b(?:up to|at most|less than|au plus|moins de|no minimum|not required|non requis)\b|"
+    r"\b\d+\s*(?:to|à|[-–—])\s*\d+\b"
+)
+DURATION = re.compile(r"(?<![0-9.,-])([1-9][0-9]?)\s*\+?\s*(years?|ans?|années?|months?|mois)\b")
+EXPERIENCE_WORD = re.compile(r"\b(?:experience|expérience|expériences)\b")
+SCALED_LEVEL = re.compile(r"\b(?:level|niveau)\s*([1-5])\s*/\s*5\b")
+CEFR_LEVEL = re.compile(r"\b(?:a1|a2|b1|b2|c1|c2)\b")
+LANGUAGE = re.compile(
+    r"\b(?:cefr|cecrl|english|anglais|french|français|german|allemand|"
+    r"spanish|espagnol|italian|italien|portuguese|portugais|dutch|néerlandais)\b"
+)
+BEFORE_MINIMUM = re.compile(
+    r"[\s:(–—-]*(?:(?:at least|minimum(?: level)?|au moins|niveau(?: minimum)?)\s+)?"
+)
+AFTER_MINIMUM = re.compile(
+    r"[\s:–—-]*(?:(?:of experience (?:in|with|using)|"
+    r"d['’]expérience (?:en|avec|sur)|in|with|using|en|avec|sur)\s+)?"
+)
+
+
+def _linked(statement: str, key: re.Match[str], threshold: re.Match[str]) -> bool:
+    if key.end() <= threshold.start():
+        return BEFORE_MINIMUM.fullmatch(statement[key.end() : threshold.start()]) is not None
+    if threshold.end() <= key.start():
+        return AFTER_MINIMUM.fullmatch(statement[threshold.end() : key.start()]) is not None
+    return False
+
+
+def explicit_threshold(requirement: Requirement) -> tuple[QualificationUnit, int | Cefr] | None:
+    statement = normalize_key(requirement.statement)
+    key = re.escape(normalize_key(requirement.key))
+    keys = list(re.finditer(rf"(?<![\w+#]){key}(?![\w+#])", statement))
+    if "\n" in requirement.statement or AMBIGUOUS.search(statement) or len(keys) != 1:
+        return None
+    matches: list[tuple[QualificationUnit, re.Match[str]]] = [
+        ("experience_months", match)
+        for match in DURATION.finditer(statement)
+        if EXPERIENCE_WORD.search(statement)
+    ]
+    matches.extend(("level", match) for match in SCALED_LEVEL.finditer(statement))
+    if LANGUAGE.search(normalize_key(requirement.key)) or re.search(
+        r"\b(?:cefr|cecrl)\b", statement
+    ):
+        matches.extend(("cefr", match) for match in CEFR_LEVEL.finditer(statement))
+    if len(matches) != 1:
+        return None
+    unit, match = matches[0]
+    if not _linked(statement, keys[0], match):
+        return None
+    if unit == "cefr":
+        return unit, cast(Cefr, match.group().upper())
+    value = int(match.group(1))
+    if unit == "experience_months" and match.group(2).startswith(("year", "an")):
+        value *= 12
+    return unit, value
+
+
+def assess_qualification(
+    threshold: tuple[QualificationUnit, int | Cefr], fact: Fact | None
+) -> Qualification:
+    unit, required = threshold
+    confirmed: int | Cefr | None = None
+    if fact is not None:
+        if unit == "experience_months":
+            confirmed = fact.experience_months
+        elif unit == "cefr":
+            confirmed = fact.cefr
+        else:
+            confirmed = fact.level
+    status: Literal["met", "not_met", "unknown"] = "unknown"
+    if isinstance(confirmed, int) and isinstance(required, int):
+        status = "met" if confirmed >= required else "not_met"
+    elif isinstance(confirmed, str) and isinstance(required, str):
+        status = "met" if CEFR_RANK[confirmed] >= CEFR_RANK[required] else "not_met"
+    return Qualification(unit=unit, required=required, confirmed=confirmed, status=status)
+
+
+QUALIFICATION_STATUS: dict[Literal["met", "not_met", "unknown"], Status] = {
+    "met": "satisfied",
+    "not_met": "partial",
+    "unknown": "unknown",
+}
 
 
 def _rounded_score(earned_half_units: int, weight: int) -> int:
@@ -149,7 +256,14 @@ class BaselineScorer:
         source_access = pair.opportunity.source_access
         for item in sorted(pair.opportunity.requirements, key=lambda item: item.requirement_id):
             fact = facts.get(normalize_key(item.key))
-            status = status_for(item, fact)
+            threshold = explicit_threshold(item)
+            qualification = assess_qualification(threshold, fact) if threshold is not None else None
+            status = (
+                QUALIFICATION_STATUS[qualification.status]
+                if qualification
+                else status_for(item, fact)
+            )
+            hard = item.hard_eligibility or (qualification is not None and item.mandatory)
             weight: Literal[1, 2] = 2 if item.mandatory else 1
             total_weight += weight
             credit = {"satisfied": 2, "partial": 1, "missing": 0}.get(status)
@@ -162,9 +276,10 @@ class BaselineScorer:
                     fact_id=fact.fact_id if fact else None,
                     minimum_level=item.minimum_level,
                     confirmed_level=fact.level if fact else None,
-                    hard_eligibility=item.hard_eligibility,
+                    hard_eligibility=hard,
                     weight=weight,
                     earned_weight=earned / 2 if earned is not None else None,
+                    qualification=qualification,
                 )
             )
             if earned is None:
@@ -172,7 +287,7 @@ class BaselineScorer:
             assessed_weight += weight
             assessed_count += 1
             earned_half_units += earned
-            if item.hard_eligibility and status != "satisfied":
+            if hard and status != "satisfied":
                 conflicts.append(item.requirement_id)
         unknown_weight = total_weight - assessed_weight
         uncertainty: Uncertainty | None = None
@@ -205,5 +320,10 @@ class BaselineScorer:
                 earned_weight=earned_half_units / 2,
                 uncertainty=uncertainty,
                 score_bounds=bounds,
+            ),
+            qualification_policy=(
+                QUALIFICATION_POLICY
+                if any(finding.qualification is not None for finding in findings)
+                else None
             ),
         )
