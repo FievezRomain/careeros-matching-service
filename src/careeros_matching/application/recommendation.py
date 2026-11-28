@@ -32,11 +32,13 @@ from careeros_matching.domain.recommendation import (
     decision,
 )
 from careeros_matching.domain.scoring import (
+    QUALIFICATION_POLICY,
     Contract,
     MatchInput,
     MatchResult,
     Owner,
     ProfileSnapshot,
+    explicit_threshold,
 )
 
 
@@ -324,6 +326,8 @@ class Recommendations:
             f"{offer.version_id}:{owner.snapshot_id}:"
             f"{profile.criteria.criteria_version_id}:{MATCHER_VERSION}"
         )
+        if any(explicit_threshold(requirement) is not None for requirement in offer.requirements):
+            basis += f":{QUALIFICATION_POLICY}"
         if job.correction_id is not None:
             basis += f":{job.correction_id}"
         evaluation_id = uuid5(owner.account_id, f"{owner.tenant_id}:{basis}")

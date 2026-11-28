@@ -64,6 +64,22 @@ records the opportunity, extractor, model and prompt versions and available usag
 metadata. A bad gateway response returns `502`; unavailability returns `503`.
 Suggestions remain separate from the confirmed requirement input to scoring.
 
+### Explicit qualification minima
+
+Verified standalone requirement statements can carry a whole number of months
+or years of experience, a level such as `4/5`, or a CEFR language level. The
+threshold must be adjacent to the named criterion, as in `Python: at least 5
+years of experience`, `SQL level 4/5` or `English B2 required`. Ambiguous ranges,
+alternatives, and upper bounds keep their existing non-quantitative assessment.
+
+The projector may supply confirmed `experienceMonths` and `cefr` on the fact
+for the same criterion. A skill level, a mention or an unrelated dated role
+does not supply a duration or CEFR value. Matching exposes the required and
+confirmed values and the qualification status in the finding. A known
+shortfall on a mandatory threshold produces a hard conflict. An unconfirmed
+value stays unknown and is excluded from scoring. New evaluations with these
+thresholds use `qualificationPolicy: explicit-requirements-v1`.
+
 ### V1-025 score explanation
 
 The scoring response adds `explanation` version `evidence-v1`. Each finding
